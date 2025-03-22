@@ -15,13 +15,13 @@ require (
 	golang.org/x/net v0.26.0
 	google.golang.org/grpc v1.64.0
 	google.golang.org/protobuf v1.34.2
-	k8s.io/api v0.30.2
-	k8s.io/apimachinery v0.30.2
-	k8s.io/client-go v0.30.2
+	k8s.io/api v0.32.3
+	k8s.io/apimachinery v0.32.3
+	k8s.io/client-go v0.32.3
 	k8s.io/klog/v2 v2.130.1
 	k8s.io/kubernetes v1.30.2
-	k8s.io/mount-utils v0.30.2
-	k8s.io/pod-security-admission v0.30.2
+	k8s.io/mount-utils v0.32.3
+	k8s.io/pod-security-admission v0.32.3
 	k8s.io/utils v0.0.0-20240502163921-fe8a2dddb1d0
 	sigs.k8s.io/cloud-provider-azure v1.30.3
 	sigs.k8s.io/controller-runtime v0.18.4
@@ -132,19 +132,19 @@ require (
 replace (
 	github.com/google/cel-go => github.com/google/cel-go v0.17.8
 	github.com/prometheus/client_golang => github.com/prometheus/client_golang v1.16.0
-	k8s.io/apiextensions-apiserver => k8s.io/apiextensions-apiserver v0.30.1
-	k8s.io/cloud-provider => k8s.io/cloud-provider v0.30.1
-	k8s.io/cluster-bootstrap => k8s.io/cluster-bootstrap v0.30.1
-	k8s.io/csi-translation-lib => k8s.io/csi-translation-lib v0.30.1
+	k8s.io/apiextensions-apiserver => k8s.io/apiextensions-apiserver v0.32.3
+	k8s.io/cloud-provider => k8s.io/cloud-provider v0.32.3
+	k8s.io/cluster-bootstrap => k8s.io/cluster-bootstrap v0.32.3
+	k8s.io/csi-translation-lib => k8s.io/csi-translation-lib v0.32.3
 	k8s.io/dynamic-resource-allocation => k8s.io/dynamic-resource-allocation v0.30.1
 	k8s.io/endpointslice => k8s.io/endpointslice v0.30.1
-	k8s.io/kube-aggregator => k8s.io/kube-aggregator v0.30.1
-	k8s.io/kube-controller-manager => k8s.io/kube-controller-manager v0.30.1
-	k8s.io/kube-proxy => k8s.io/kube-proxy v0.30.1
-	k8s.io/kube-scheduler => k8s.io/kube-scheduler v0.30.1
-	k8s.io/kubectl => k8s.io/kubectl v0.30.1
-	k8s.io/kubelet => k8s.io/kubelet v0.30.1
-	k8s.io/legacy-cloud-providers => k8s.io/legacy-cloud-providers v0.30.1
-	k8s.io/pod-security-admission => k8s.io/pod-security-admission v0.30.1
-	k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.30.1
+	k8s.io/kube-aggregator => k8s.io/kube-aggregator v0.32.3
+	k8s.io/kube-controller-manager => k8s.io/kube-controller-manager v0.32.3
+	k8s.io/kube-proxy => k8s.io/kube-proxy v0.32.3
+	k8s.io/kube-scheduler => k8s.io/kube-scheduler v0.32.3
+	k8s.io/kubectl => k8s.io/kubectl v0.32.3
+	k8s.io/kubelet => k8s.io/kubelet v0.32.3
+	k8s.io/legacy-cloud-providers => k8s.io/legacy-cloud-providers v0.30.11
+	k8s.io/pod-security-admission => k8s.io/pod-security-admission v0.32.3
+	k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.32.3
 )
