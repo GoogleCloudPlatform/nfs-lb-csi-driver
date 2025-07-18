@@ -1,8 +1,6 @@
 module github.com/GoogleCloudPlatform/nfs-lb-csi-driver
 
-go 1.22.0
-
-toolchain go1.22.2
+go 1.23.0
 
 require (
 	github.com/container-storage-interface/spec v1.9.0
@@ -100,7 +98,7 @@ require (
 	go.uber.org/zap v1.27.0 // indirect
 	golang.org/x/crypto v0.24.0 // indirect
 	golang.org/x/exp v0.0.0-20240613232115-7f521ea00fb8 // indirect
-	golang.org/x/oauth2 v0.21.0 // indirect
+	golang.org/x/oauth2 v0.27.0 // indirect
 	golang.org/x/sync v0.7.0 // indirect
 	golang.org/x/sys v0.21.0 // indirect
 	golang.org/x/term v0.21.0 // indirect
