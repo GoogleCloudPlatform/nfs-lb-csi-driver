@@ -66,16 +66,13 @@ func (s String) Compare(other ref.Val) ref.Val {
 func (s String) ConvertToNative(typeDesc reflect.Type) (any, error) {
 	switch typeDesc.Kind() {
 	case reflect.String:
-		if reflect.TypeOf(s).AssignableTo(typeDesc) {
-			return s, nil
-		}
-		return s.Value(), nil
+		return reflect.ValueOf(s).Convert(typeDesc).Interface(), nil
 	case reflect.Ptr:
 		switch typeDesc {
 		case anyValueType:
 			// Primitives must be wrapped before being set on an Any field.
 			return anypb.New(wrapperspb.String(string(s)))
-		case jsonValueType:
+		case JSONValueType:
 			// Convert to a protobuf representation of a JSON String.
 			return structpb.NewStringValue(string(s)), nil
 		case stringWrapperType:
@@ -125,7 +122,11 @@ func (s String) ConvertToType(typeVal ref.Type) ref.Val {
 			return durationOf(d)
 		}
 	case TimestampType:
-		if t, err := time.Parse(time.RFC3339, s.Value().(string)); err == nil {
+		str := s.Value().(string)
+		if !isStrictRFC3339(str) {
+			return NewErr("invalid RFC 3339 timestamp %q", str)
+		}
+		if t, err := time.Parse(time.RFC3339, str); err == nil {
 			if t.Unix() < minUnixTime || t.Unix() > maxUnixTime {
 				return celErrTimestampOverflow
 			}
@@ -158,7 +159,7 @@ func (s String) Match(pattern ref.Val) ref.Val {
 	}
 	matched, err := regexp.MatchString(pat.Value().(string), s.Value().(string))
 	if err != nil {
-		return &Err{err}
+		return &Err{error: err}
 	}
 	return Bool(matched)
 }
@@ -187,6 +188,10 @@ func (s String) Type() ref.Type {
 // Value implements ref.Val.Value.
 func (s String) Value() any {
 	return string(s)
+}
+
+func (s String) format(sb *strings.Builder) {
+	sb.WriteString(strconv.Quote(string(s)))
 }
 
 // StringContains returns whether the string contains a substring.
