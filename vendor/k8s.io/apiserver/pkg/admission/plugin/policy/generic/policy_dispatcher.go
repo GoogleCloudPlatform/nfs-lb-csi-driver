@@ -22,21 +22,24 @@ import (
 	"fmt"
 	"time"
 
-	"k8s.io/api/admissionregistration/v1"
+	v1 "k8s.io/api/admissionregistration/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/admission/plugin/policy/matching"
 	webhookgeneric "k8s.io/apiserver/pkg/admission/plugin/webhook/generic"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/cache"
 )
 
-// A policy invocation is a single policy-binding-param tuple from a Policy Hook
+// PolicyInvocation is a single policy-binding-param tuple from a Policy Hook
 // in the context of a specific request. The params have already been resolved
 // and any error in configuration or setting up the invocation is stored in
 // the Error field.
@@ -62,10 +65,6 @@ type PolicyInvocation[P runtime.Object, B runtime.Object, E Evaluator] struct {
 
 	// Params fetched by the binding to use to evaluate the policy
 	Param runtime.Object
-
-	// Error is set if there was an error with the policy or binding or its
-	// params, etc
-	Error error
 }
 
 // dispatcherDelegate is called during a request with a pre-filtered list
@@ -76,7 +75,7 @@ type PolicyInvocation[P runtime.Object, B runtime.Object, E Evaluator] struct {
 //
 // The delegate provides the "validation" or "mutation" aspect of dispatcher functionality
 // (in contrast to generic.PolicyDispatcher which only selects active policies and params)
-type dispatcherDelegate[P, B runtime.Object, E Evaluator] func(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces, versionedAttributes webhookgeneric.VersionedAttributeAccessor, invocations []PolicyInvocation[P, B, E]) error
+type dispatcherDelegate[P, B runtime.Object, E Evaluator] func(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces, versionedAttributes webhookgeneric.VersionedAttributeAccessor, invocations []PolicyInvocation[P, B, E]) ([]PolicyError, *apierrors.StatusError)
 
 type policyDispatcher[P runtime.Object, B runtime.Object, E Evaluator] struct {
 	newPolicyAccessor  func(P) PolicyAccessor
@@ -104,7 +103,10 @@ func NewPolicyDispatcher[P runtime.Object, B runtime.Object, E Evaluator](
 // request. It then resolves all params and creates an Invocation for each
 // matching policy-binding-param tuple. The delegate is then called with the
 // list of tuples.
-//
+func (d *policyDispatcher[P, B, E]) Start(ctx context.Context) error {
+	return nil
+}
+
 // Note: MatchConditions expressions are not evaluated here. The dispatcher delegate
 // is expected to ignore the result of any policies whose match conditions dont pass.
 // This may be possible to refactor so matchconditions are checked here instead.
@@ -117,29 +119,33 @@ func (d *policyDispatcher[P, B, E]) Dispatch(ctx context.Context, a admission.At
 		objectInterfaces: o,
 	}
 
+	var policyErrors []PolicyError
+	addConfigError := func(err error, definition PolicyAccessor, binding BindingAccessor) {
+		var message error
+		if binding == nil {
+			message = fmt.Errorf("failed to configure policy: %w", err)
+		} else {
+			message = fmt.Errorf("failed to configure binding: %w", err)
+		}
+
+		policyErrors = append(policyErrors, PolicyError{
+			Policy:  definition,
+			Binding: binding,
+			Message: message,
+		})
+	}
+
 	for _, hook := range hooks {
 		policyAccessor := d.newPolicyAccessor(hook.Policy)
 		matches, matchGVR, matchGVK, err := d.matcher.DefinitionMatches(a, o, policyAccessor)
 		if err != nil {
 			// There was an error evaluating if this policy matches anything.
-			utilruntime.HandleError(err)
-			relevantHooks = append(relevantHooks, PolicyInvocation[P, B, E]{
-				Policy: hook.Policy,
-				Error:  err,
-			})
+			addConfigError(err, policyAccessor, nil)
 			continue
 		} else if !matches {
 			continue
 		} else if hook.ConfigurationError != nil {
-			// The policy matches but there is a configuration error with the
-			// policy itself
-			relevantHooks = append(relevantHooks, PolicyInvocation[P, B, E]{
-				Policy:   hook.Policy,
-				Error:    hook.ConfigurationError,
-				Resource: matchGVR,
-				Kind:     matchGVK,
-			})
-			utilruntime.HandleError(hook.ConfigurationError)
+			addConfigError(hook.ConfigurationError, policyAccessor, nil)
 			continue
 		}
 
@@ -148,16 +154,19 @@ func (d *policyDispatcher[P, B, E]) Dispatch(ctx context.Context, a admission.At
 			matches, err = d.matcher.BindingMatches(a, o, bindingAccessor)
 			if err != nil {
 				// There was an error evaluating if this binding matches anything.
-				utilruntime.HandleError(err)
-				relevantHooks = append(relevantHooks, PolicyInvocation[P, B, E]{
-					Policy:   hook.Policy,
-					Binding:  binding,
-					Error:    err,
-					Resource: matchGVR,
-					Kind:     matchGVK,
-				})
+				addConfigError(err, policyAccessor, bindingAccessor)
 				continue
 			} else if !matches {
+				continue
+			}
+
+			// here the binding matches.
+			// VersionedAttr result will be cached and reused later during parallel
+			// hook calls.
+			if _, err = versionedAttrAccessor.VersionedAttribute(matchGVK); err != nil {
+				// VersionedAttr result will be cached and reused later during parallel
+				// hook calls.
+				addConfigError(err, policyAccessor, nil)
 				continue
 			}
 
@@ -168,17 +177,12 @@ func (d *policyDispatcher[P, B, E]) Dispatch(ctx context.Context, a admission.At
 				hook.ParamScope,
 				bindingAccessor.GetParamRef(),
 				a.GetNamespace(),
+				hook.DynamicClient,
+				hook.RESTMapper,
 			)
 			if err != nil {
 				// There was an error collecting params for this binding.
-				utilruntime.HandleError(err)
-				relevantHooks = append(relevantHooks, PolicyInvocation[P, B, E]{
-					Policy:   hook.Policy,
-					Binding:  binding,
-					Error:    err,
-					Resource: matchGVR,
-					Kind:     matchGVK,
-				})
+				addConfigError(err, policyAccessor, bindingAccessor)
 				continue
 			}
 
@@ -194,34 +198,88 @@ func (d *policyDispatcher[P, B, E]) Dispatch(ctx context.Context, a admission.At
 					Evaluator: hook.Evaluator,
 				})
 			}
+		}
+	}
 
-			// VersionedAttr result will be cached and reused later during parallel
-			// hook calls
-			_, err = versionedAttrAccessor.VersionedAttribute(matchGVK)
-			if err != nil {
-				return apierrors.NewInternalError(err)
-			}
+	if len(relevantHooks) > 0 {
+		extraPolicyErrors, statusError := d.delegate(ctx, a, o, versionedAttrAccessor, relevantHooks)
+		if statusError != nil {
+			return statusError
+		}
+		policyErrors = append(policyErrors, extraPolicyErrors...)
+	}
+
+	var filteredErrors []PolicyError
+	for _, e := range policyErrors {
+		// we always default the FailurePolicy if it is unset and validate it in API level
+		var policy v1.FailurePolicyType
+		if fp := e.Policy.GetFailurePolicy(); fp == nil {
+			policy = v1.Fail
+		} else {
+			policy = *fp
 		}
 
+		switch policy {
+		case v1.Ignore:
+			// TODO: add metrics for ignored error here
+			continue
+		case v1.Fail:
+			filteredErrors = append(filteredErrors, e)
+		default:
+			filteredErrors = append(filteredErrors, e)
+		}
 	}
 
-	if len(relevantHooks) == 0 {
-		// no matching hooks
-		return nil
+	if len(filteredErrors) > 0 {
+
+		forbiddenErr := admission.NewForbidden(a, fmt.Errorf("admission request denied by policy"))
+
+		// The forbiddenErr is always a StatusError.
+		var err *apierrors.StatusError
+		if !errors.As(forbiddenErr, &err) {
+			// Should never happen.
+			return apierrors.NewInternalError(fmt.Errorf("failed to create status error"))
+		}
+		err.ErrStatus.Message = ""
+
+		for _, policyError := range filteredErrors {
+			message := policyError.Error()
+
+			// If this is the first denied decision, use its message and reason
+			// for the status error message.
+			if err.ErrStatus.Message == "" {
+				err.ErrStatus.Message = message
+				if policyError.Reason != "" {
+					err.ErrStatus.Reason = policyError.Reason
+				}
+			}
+
+			// Add the denied decision's message to the status error's details
+			err.ErrStatus.Details.Causes = append(
+				err.ErrStatus.Details.Causes,
+				metav1.StatusCause{Message: message})
+		}
+
+		return err
 	}
 
-	return d.delegate(ctx, a, o, versionedAttrAccessor, relevantHooks)
+	return nil
 }
 
 // Returns params to use to evaluate a policy-binding with given param
 // configuration. If the policy-binding has no param configuration, it
 // returns a single-element list with a nil param.
+//
+// The dynamicClient and restMapper parameters enable direct API fallback when
+// the informer cache hasn't received the watch event for a newly created param yet.
 func CollectParams(
 	paramKind *v1.ParamKind,
 	paramInformer informers.GenericInformer,
 	paramScope meta.RESTScope,
 	paramRef *v1.ParamRef,
 	namespace string,
+	dynamicClient dynamic.Interface,
+	restMapper meta.RESTMapper,
 ) ([]runtime.Object, error) {
 	// If definition has paramKind, paramRef is required in binding.
 	// If definition has no paramKind, paramRef set in binding will be ignored.
@@ -283,7 +341,20 @@ func CollectParams(
 			return nil, fmt.Errorf("paramRef.name and paramRef.selector are mutually exclusive")
 		}
 
-		switch param, err := paramStore.Get(paramRef.Name); {
+		// First attempt: try to get the param from the informer cache (fast path)
+		param, err := paramStore.Get(paramRef.Name)
+
+		// If cache returns NotFound and we have a client, try direct API call as fallback.
+		// This handles the race condition where resources (ConfigMap, Policy, Binding, and Param)
+		// are created in quick succession. The informer cache may have completed its initial
+		// sync (checked by WaitForCacheSync above), but newly created params might not have
+		// propagated to the cache yet. The direct API call ensures we get the correct answer
+		// without timing-dependent retry logic.
+		if apierrors.IsNotFound(err) && dynamicClient != nil && restMapper != nil && paramKind != nil {
+			param, err = getParamDirectly(dynamicClient, restMapper, paramKind, paramRef, namespace, paramScope)
+		}
+
+		switch {
 		case err == nil:
 			params = []runtime.Object{param}
 		case apierrors.IsNotFound(err):
@@ -333,6 +404,80 @@ func CollectParams(
 	return params, nil
 }
 
+// getParamDirectly performs a direct API call to retrieve a param when the informer
+// cache doesn't have it yet. This handles the race condition where a param resource
+// is created but the watch event hasn't propagated to the informer cache.
+func getParamDirectly(
+	dynamicClient dynamic.Interface,
+	restMapper meta.RESTMapper,
+	paramKind *v1.ParamKind,
+	paramRef *v1.ParamRef,
+	namespace string,
+	paramScope meta.RESTScope,
+) (runtime.Object, error) {
+	// Convert GVK to GVR using the RESTMapper
+	gv, err := schema.ParseGroupVersion(paramKind.APIVersion)
+	if err != nil {
+		return nil, fmt.Errorf("invalid paramKind APIVersion %q: %w", paramKind.APIVersion, err)
+	}
+	gvk := gv.WithKind(paramKind.Kind)
+
+	mapping, err := restMapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+	if err != nil {
+		// An unknown paramKind (CRD not registered or deleted) is reported as
+		// NotFound so the caller routes it through ParameterNotFoundAction
+		// instead of failing the admission request as an internal error.
+		if meta.IsNoMatchError(err) {
+			return nil, apierrors.NewNotFound(schema.GroupResource{Group: gvk.Group, Resource: gvk.Kind}, paramRef.Name)
+		}
+		return nil, fmt.Errorf("failed to find REST mapping for %v: %w", gvk, err)
+	}
+
+	// Determine the namespace for the Get request
+	var targetNamespace string
+	if paramScope.Name() == meta.RESTScopeNameNamespace {
+		if len(paramRef.Namespace) > 0 {
+			targetNamespace = paramRef.Namespace
+		} else {
+			targetNamespace = namespace
+		}
+	}
+
+	// Perform the direct API call with a timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	var resourceClient dynamic.ResourceInterface
+	if targetNamespace != "" {
+		resourceClient = dynamicClient.Resource(mapping.Resource).Namespace(targetNamespace)
+	} else {
+		resourceClient = dynamicClient.Resource(mapping.Resource)
+	}
+
+	param, err := resourceClient.Get(ctx, paramRef.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return convertParamToInformerRepresentation(gvk, param)
+}
+
+// convertParamToInformerRepresentation makes a get response object look like an informer object by
+// representing it as unstructured and without TypeMeta. This ensures that CEL expressions
+// receive param objects identically regardless of if the object was received via the informer
+// or if an informer cache miss resulted in a get request to fetch the object.
+func convertParamToInformerRepresentation(gvk schema.GroupVersionKind, param *unstructured.Unstructured) (runtime.Object, error) {
+	typed, err := clientgoscheme.Scheme.New(gvk)
+	if err != nil {
+		// The kind has no typed representation, so its informer also serves unstructured objects.
+		return param, nil
+	}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(param.UnstructuredContent(), typed); err != nil {
+		return nil, fmt.Errorf("failed to convert param %v to typed object: %w", gvk, err)
+	}
+	typed.GetObjectKind().SetGroupVersionKind(schema.GroupVersionKind{})
+	return typed, nil
+}
+
 var _ webhookgeneric.VersionedAttributeAccessor = &versionedAttributeAccessor{}
 
 type versionedAttributeAccessor struct {
@@ -351,4 +496,19 @@ func (v *versionedAttributeAccessor) VersionedAttribute(gvk schema.GroupVersionK
 	}
 	v.versionedAttrs[gvk] = versionedAttr
 	return versionedAttr, nil
+}
+
+type PolicyError struct {
+	Policy  PolicyAccessor
+	Binding BindingAccessor
+	Message error
+	Reason  metav1.StatusReason
+}
+
+func (c PolicyError) Error() string {
+	if c.Binding != nil {
+		return fmt.Sprintf("policy '%s' with binding '%s' denied request: %s", c.Policy.GetName(), c.Binding.GetName(), c.Message.Error())
+	}
+
+	return fmt.Sprintf("policy %q denied request: %s", c.Policy.GetName(), c.Message.Error())
 }
