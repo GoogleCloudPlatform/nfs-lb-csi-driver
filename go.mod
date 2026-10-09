@@ -2,7 +2,7 @@ module github.com/GoogleCloudPlatform/nfs-lb-csi-driver
 
 go 1.22.0
 
-toolchain go1.22.2
+toolchain go1.27.2
 
 require (
 	github.com/container-storage-interface/spec v1.9.0
