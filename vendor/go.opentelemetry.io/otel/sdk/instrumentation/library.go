@@ -1,8 +1,9 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-package instrumentation // import "go.opentelemetry.io/otel/sdk/instrumentation"
+package instrumentation
 
 // Library represents the instrumentation library.
-// Deprecated: please use Scope instead.
+//
+// Deprecated: use [Scope] instead.
 type Library = Scope

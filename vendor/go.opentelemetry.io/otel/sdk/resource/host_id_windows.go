@@ -2,25 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //go:build windows
-// +build windows
 
-package resource // import "go.opentelemetry.io/otel/sdk/resource"
+package resource
 
 import (
 	"golang.org/x/sys/windows/registry"
 )
 
-// implements hostIDReader
+// implements hostIDReader.
 type hostIDReaderWindows struct{}
 
-// read reads MachineGuid from the windows registry key:
-// SOFTWARE\Microsoft\Cryptography
+// read reads MachineGuid from the Windows registry key:
+// SOFTWARE\Microsoft\Cryptography.
 func (*hostIDReaderWindows) read() (string, error) {
 	k, err := registry.OpenKey(
 		registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Cryptography`,
 		registry.QUERY_VALUE|registry.WOW64_64KEY,
 	)
-
 	if err != nil {
 		return "", err
 	}
