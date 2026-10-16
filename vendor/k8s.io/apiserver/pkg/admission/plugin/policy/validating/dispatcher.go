@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utiljson "k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apiserver/pkg/admission"
+	admissionauthorizer "k8s.io/apiserver/pkg/admission/plugin/authorizer"
 	"k8s.io/apiserver/pkg/admission/plugin/policy/generic"
 	celmetrics "k8s.io/apiserver/pkg/admission/plugin/policy/validating/metrics"
 	celconfig "k8s.io/apiserver/pkg/apis/cel"
@@ -40,13 +41,13 @@ import (
 
 type dispatcher struct {
 	matcher generic.PolicyMatcher
-	authz   authorizer.Authorizer
+	authz   authorizer.UnconditionalAuthorizer
 }
 
 var _ generic.Dispatcher[PolicyHook] = &dispatcher{}
 
 func NewDispatcher(
-	authorizer authorizer.Authorizer,
+	authorizer authorizer.UnconditionalAuthorizer,
 	matcher generic.PolicyMatcher,
 ) generic.Dispatcher[PolicyHook] {
 	return &dispatcher{
@@ -63,10 +64,14 @@ type policyDecisionWithMetadata struct {
 	Binding    *admissionregistrationv1.ValidatingAdmissionPolicyBinding
 }
 
+func (c *dispatcher) Start(ctx context.Context) error {
+	return nil
+}
+
 // Dispatch implements generic.Dispatcher.
 func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces, hooks []PolicyHook) error {
-
 	var deniedDecisions []policyDecisionWithMetadata
+	var validationFailures []ValidationFailureValue
 
 	addConfigError := func(err error, definition *admissionregistrationv1.ValidatingAdmissionPolicy, binding *admissionregistrationv1.ValidatingAdmissionPolicyBinding) {
 		// we always default the FailurePolicy if it is unset and validate it in API level
@@ -109,15 +114,10 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 		}
 	}
 
-	authz := newCachingAuthorizer(c.authz)
+	authz := admissionauthorizer.NewCachingAuthorizer(c.authz)
+	versionedAttrs := map[schema.GroupVersionKind]*admission.VersionedAttributes{}
 
 	for _, hook := range hooks {
-		// versionedAttributes will be set to non-nil inside of the loop, but
-		// is scoped outside of the param loop so we only convert once. We defer
-		// conversion so that it is only performed when we know a policy matches,
-		// saving the cost of converting non-matching requests.
-		var versionedAttr *admission.VersionedAttributes
-
 		definition := hook.Policy
 		matches, matchResource, matchKind, err := c.matcher.DefinitionMatches(a, o, NewValidatingAdmissionPolicyAccessor(definition))
 		if err != nil {
@@ -154,12 +154,17 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 				hook.ParamScope,
 				binding.Spec.ParamRef,
 				a.GetNamespace(),
+				hook.DynamicClient,
+				hook.RESTMapper,
 			)
 
 			if err != nil {
 				addConfigError(err, definition, binding)
 				continue
-			} else if versionedAttr == nil && len(params) > 0 {
+			}
+
+			versionedAttr := versionedAttrs[matchKind]
+			if versionedAttr == nil && len(params) > 0 {
 				// As optimization versionedAttr creation is deferred until
 				// first use. Since > 0 params, we will validate
 				va, err := admission.NewVersionedAttributes(a, matchKind, o)
@@ -169,6 +174,7 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 					continue
 				}
 				versionedAttr = va
+				versionedAttrs[matchKind] = va
 			}
 
 			var validationResults []ValidateResult
@@ -184,7 +190,7 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 			// if it is cluster scoped, namespaceName will be empty
 			// Otherwise, get the Namespace resource.
 			if namespaceName != "" {
-				namespace, err = c.matcher.GetNamespace(namespaceName)
+				namespace, err = c.matcher.GetNamespace(ctx, namespaceName)
 				if err != nil {
 					return err
 				}
@@ -223,7 +229,7 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 					switch decision.Action {
 					case ActionAdmit:
 						if decision.Evaluation == EvalError {
-							celmetrics.Metrics.ObserveAdmissionWithError(ctx, decision.Elapsed, definition.Name, binding.Name, "active")
+							celmetrics.Metrics.ObserveAdmission(ctx, decision.Elapsed, definition.Name, binding.Name, ErrorType(&decision))
 						}
 					case ActionDeny:
 						for _, action := range binding.Spec.ValidationActions {
@@ -234,13 +240,19 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 									Binding:        binding,
 									PolicyDecision: decision,
 								})
-								celmetrics.Metrics.ObserveRejection(ctx, decision.Elapsed, definition.Name, binding.Name, "active")
+								celmetrics.Metrics.ObserveRejection(ctx, decision.Elapsed, definition.Name, binding.Name, ErrorType(&decision))
 							case admissionregistrationv1.Audit:
-								publishValidationFailureAnnotation(binding, i, decision, versionedAttr)
-								celmetrics.Metrics.ObserveAudit(ctx, decision.Elapsed, definition.Name, binding.Name, "active")
+								validationFailures = append(validationFailures, ValidationFailureValue{
+									ExpressionIndex:   i,
+									Message:           decision.Message,
+									ValidationActions: binding.Spec.ValidationActions,
+									Binding:           binding.Name,
+									Policy:            binding.Spec.PolicyName,
+								})
+								celmetrics.Metrics.ObserveAudit(ctx, decision.Elapsed, definition.Name, binding.Name, ErrorType(&decision))
 							case admissionregistrationv1.Warn:
 								warning.AddWarning(ctx, "", fmt.Sprintf("Validation failed for ValidatingAdmissionPolicy '%s' with binding '%s': %s", definition.Name, binding.Name, decision.Message))
-								celmetrics.Metrics.ObserveWarn(ctx, decision.Elapsed, definition.Name, binding.Name, "active")
+								celmetrics.Metrics.ObserveWarn(ctx, decision.Elapsed, definition.Name, binding.Name, ErrorType(&decision))
 							}
 						}
 					default:
@@ -259,7 +271,7 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 						auditAnnotationCollector.add(auditAnnotation.Key, value)
 					case AuditAnnotationActionError:
 						// When failurePolicy=fail, audit annotation errors result in deny
-						deniedDecisions = append(deniedDecisions, policyDecisionWithMetadata{
+						d := policyDecisionWithMetadata{
 							Definition: definition,
 							Binding:    binding,
 							PolicyDecision: PolicyDecision{
@@ -268,8 +280,9 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 								Message:    auditAnnotation.Error,
 								Elapsed:    auditAnnotation.Elapsed,
 							},
-						})
-						celmetrics.Metrics.ObserveRejection(ctx, auditAnnotation.Elapsed, definition.Name, binding.Name, "active")
+						}
+						deniedDecisions = append(deniedDecisions, d)
+						celmetrics.Metrics.ObserveRejection(ctx, auditAnnotation.Elapsed, definition.Name, binding.Name, ErrorType(&d.PolicyDecision))
 					case AuditAnnotationActionExclude: // skip it
 					default:
 						return fmt.Errorf("unsupported AuditAnnotation Action: %s", auditAnnotation.Action)
@@ -278,6 +291,10 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 			}
 		}
 		auditAnnotationCollector.publish(definition.Name, a)
+	}
+
+	if len(validationFailures) > 0 {
+		publishValidationFailureAnnotations(a, validationFailures)
 	}
 
 	if len(deniedDecisions) > 0 {
@@ -302,23 +319,38 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 	return nil
 }
 
-func publishValidationFailureAnnotation(binding *admissionregistrationv1.ValidatingAdmissionPolicyBinding, expressionIndex int, decision PolicyDecision, attributes admission.Attributes) {
+// maxValidationFailures is the maximum number of validation failures to include in the audit annotation
+// to prevent audit logs resource exhaustion.
+// The expected size of 50 validation failures is ~10KB.
+const maxValidationFailures = 50
+
+func publishValidationFailureAnnotations(attributes admission.Attributes, failures []ValidationFailureValue) {
+	if len(failures) == 0 {
+		return
+	}
+	if len(failures) > maxValidationFailures {
+		klog.Warningf("Validation failures count %d for resource %s exceeds limit of %d; truncating audit annotation", len(failures), attributes.GetResource().String(), maxValidationFailures)
+		failures = failures[:maxValidationFailures]
+	}
+
 	key := "validation.policy.admission.k8s.io/validation_failure"
-	// Marshal to a list of failures since, in the future, we may need to support multiple failures
-	valueJSON, err := utiljson.Marshal([]ValidationFailureValue{{
-		ExpressionIndex:   expressionIndex,
-		Message:           decision.Message,
-		ValidationActions: binding.Spec.ValidationActions,
-		Binding:           binding.Name,
-		Policy:            binding.Spec.PolicyName,
-	}})
+	valueJSON, err := utiljson.Marshal(failures)
 	if err != nil {
-		klog.Warningf("Failed to set admission audit annotation %s for ValidatingAdmissionPolicy %s and ValidatingAdmissionPolicyBinding %s: %v", key, binding.Spec.PolicyName, binding.Name, err)
+		klog.Warningf("Failed to marshal admission audit validation failures for key %s for ValidatingAdmissionPolicies and ValidatingAdmissionPolicyBindings %s: %v", key, formatPoliciesBindings(failures), err)
+		return
 	}
 	value := string(valueJSON)
 	if err := attributes.AddAnnotation(key, value); err != nil {
-		klog.Warningf("Failed to set admission audit annotation %s to %s for ValidatingAdmissionPolicy %s and ValidatingAdmissionPolicyBinding %s: %v", key, value, binding.Spec.PolicyName, binding.Name, err)
+		klog.Warningf("Failed to set admission audit annotation %s to %s for ValidatingAdmissionPolicies and ValidatingAdmissionPolicyBindings %s: %v", key, value, formatPoliciesBindings(failures), err)
 	}
+}
+
+func formatPoliciesBindings(failures []ValidationFailureValue) string {
+	var policiesBindings []string
+	for _, failure := range failures {
+		policiesBindings = append(policiesBindings, fmt.Sprintf("%s/%s", failure.Policy, failure.Binding))
+	}
+	return strings.Join(policiesBindings, ", ")
 }
 
 const maxAuditAnnotationValueLength = 10 * 1024

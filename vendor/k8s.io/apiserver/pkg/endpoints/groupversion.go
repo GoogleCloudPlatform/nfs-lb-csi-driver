@@ -28,7 +28,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/managedfields"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/endpoints/discovery"
@@ -71,9 +70,6 @@ type APIGroupVersion struct {
 	// version (for when the inevitable meta/v2 group emerges).
 	MetaGroupVersion *schema.GroupVersion
 
-	// RootScopedKinds are the root scoped kinds for the primary GroupVersion
-	RootScopedKinds sets.String
-
 	// Serializer is used to determine how to convert responses from API methods into bytes to send over
 	// the wire.
 	Serializer     runtime.NegotiatedSerializer
@@ -93,7 +89,7 @@ type APIGroupVersion struct {
 	// Authorizer determines whether a user is allowed to make a certain request. The Handler does a preliminary
 	// authorization check using the request URI but it may be necessary to make additional checks, such as in
 	// the create-on-update case
-	Authorizer authorizer.Authorizer
+	Authorizer authorizer.UnconditionalAuthorizer
 
 	Admit admission.Interface
 
